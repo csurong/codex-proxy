@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.venv/
+.pytest_cache/
+
+# Node
+node_modules/
+.svelte-kit/
+
+# Rust / Tauri
+src-tauri/target/
+
+# Build output
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
+.env.*
+
+# Data / runtime
+*.db
+*.db-journal
+*.db-wal
+*.log
