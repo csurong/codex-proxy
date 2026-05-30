@@ -166,6 +166,21 @@ def body_has_images(body: dict[str, Any]) -> bool:
     return False
 
 
+def _content_has_images(content: Any) -> bool:
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(part, dict) and part.get("type") == "image_url" for part in content)
+
+
+def latest_user_message_has_images(body: dict[str, Any]) -> bool:
+    """Return whether the latest user message contains image_url content."""
+    for message in reversed(body.get("messages", [])):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        return _content_has_images(message.get("content"))
+    return False
+
+
 def find_image_model(provider: ProviderRuntime) -> ModelMeta | None:
     """Pick the first image-capable model declared for this provider."""
     return next((m for m in provider.models if m.supports_images), None)

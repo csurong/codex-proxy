@@ -27,6 +27,7 @@ Codex -> /v1/responses -> Codex-Proxy -> /chat/completions -> 上游模型服务
 - 支持 provider / model alias 配置
 - 支持 MiMo `web_search` 转发；token-plan key 会自动降级，避免无效请求
 - 请求包含图片时，如果当前模型不支持图片，会自动路由到同一 provider 下支持图片的模型
+- 图片路由可选择只看当前消息，或包含历史图片上下文
 - 一键写入 / 恢复 Codex 配置，并保留时间戳备份
 - 支持 Responses API 流式输出、tool calls、reasoning、usage 和请求日志
 - 提供 macOS Tauri 桌面壳，内置 Python sidecar
@@ -169,6 +170,7 @@ editing `~/.codex/auth.json` and `~/.codex/config.toml` by hand.
 - Provider and model alias support through provider config JSON
 - MiMo `web_search` forwarding; token-plan keys are safely downgraded
 - Automatic image request routing to an image-capable model in the same provider
+- Image routing can use only the latest user message or include historical image context
 - One-click Codex config apply/restore with timestamped backups
 - Streaming Responses API translation, tool calls, reasoning, usage, and request logs
 - macOS Tauri desktop shell with a bundled Python sidecar

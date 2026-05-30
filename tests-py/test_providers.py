@@ -6,6 +6,7 @@ from codex_proxy.providers import (
     normalize_mimo, normalize_vllm, normalize_custom, normalize_body,
     resolve_mimo_base_url, find_provider_for_model, resolve_provider_for_model,
     strip_images_for_non_vision, body_has_images, find_image_model,
+    latest_user_message_has_images,
 )
 
 
@@ -199,6 +200,32 @@ def test_body_has_images_detects_chat_image_parts():
         ]}],
     }) is True
     assert body_has_images({"messages": [{"role": "user", "content": "look"}]}) is False
+
+
+def test_latest_user_message_has_images_ignores_historical_images():
+    body = {"messages": [
+        {"role": "user", "content": [
+            {"type": "text", "text": "describe this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]},
+        {"role": "assistant", "content": "It is a chart."},
+        {"role": "user", "content": "now summarize the answer in one sentence"},
+    ]}
+
+    assert body_has_images(body) is True
+    assert latest_user_message_has_images(body) is False
+
+
+def test_latest_user_message_has_images_detects_current_image():
+    body = {"messages": [
+        {"role": "user", "content": "previous text"},
+        {"role": "user", "content": [
+            {"type": "text", "text": "describe this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]},
+    ]}
+
+    assert latest_user_message_has_images(body) is True
 
 
 def test_find_image_model_picks_first_vision_model(mimo_runtime):

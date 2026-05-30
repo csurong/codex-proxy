@@ -114,6 +114,7 @@
   $: filtered = showErrorsOnly ? logs.filter(l => l.status_code >= 400) : logs;
   $: thinkingDisabled = settings?.thinking_disabled === "1";
   $: forceHighEffort = settings?.thinking_force_high_effort === "1";
+  $: visionRouteIncludeHistory = settings?.vision_route_include_history === "1";
 
   function fmtDuration(ms: number) {
     if (!ms) return "-";
@@ -199,6 +200,15 @@
           class="toggle {forceHighEffort ? 'active' : ''}"
           title="Use high reasoning effort when thinking is enabled"
           on:click={() => toggleSetting("thinking_force_high_effort", !forceHighEffort)}
+        ></button>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+        <span style="font-size:13px;color:var(--text-dim);">Use history for vision routing</span>
+        <button
+          type="button"
+          class="toggle {visionRouteIncludeHistory ? 'active' : ''}"
+          title="Keep routing to a vision model when earlier messages in the conversation contain images"
+          on:click={() => toggleSetting("vision_route_include_history", !visionRouteIncludeHistory)}
         ></button>
       </div>
     </div>

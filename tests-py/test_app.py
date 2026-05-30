@@ -386,6 +386,104 @@ def test_image_request_routes_to_same_provider_vision_model(client, monkeypatch)
     assert captured["body"]["messages"][0]["content"][1]["type"] == "image_url"
 
 
+def test_text_request_after_historical_image_uses_selected_text_model(client, monkeypatch):
+    monkeypatch.setattr(app_module, "_proxy_running", True)
+    captured = {}
+
+    async def fake_call_upstream(base_url, api_key, body, timeout=120.0, retries=1):
+        captured["body"] = body
+        return ChatResponse(
+            id="chatcmpl-test",
+            model=body["model"],
+            choices=[ChatChoice(message=ChatChoiceMessage(content="ok"))],
+        )
+
+    monkeypatch.setattr(app_module, "call_upstream", fake_call_upstream)
+
+    resp = client.post("/v1/responses", json={
+        "model": "mimo-v2.5-pro",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "describe this"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                ],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "It is a chart."}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "summarize that in one sentence"}],
+            },
+        ],
+    })
+
+    assert resp.status_code == 200
+    assert captured["body"]["model"] == "mimo-v2.5-pro"
+    assert all(
+        part.get("type") != "image_url"
+        for message in captured["body"]["messages"]
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+    )
+
+
+def test_history_image_setting_keeps_vision_model_for_followup_text(client, monkeypatch):
+    monkeypatch.setattr(app_module, "_proxy_running", True)
+    captured = {}
+
+    client.patch("/admin/api/settings", json={"vision_route_include_history": "1"})
+
+    async def fake_call_upstream(base_url, api_key, body, timeout=120.0, retries=1):
+        captured["body"] = body
+        return ChatResponse(
+            id="chatcmpl-test",
+            model=body["model"],
+            choices=[ChatChoice(message=ChatChoiceMessage(content="ok"))],
+        )
+
+    monkeypatch.setattr(app_module, "call_upstream", fake_call_upstream)
+
+    resp = client.post("/v1/responses", json={
+        "model": "mimo-v2.5-pro",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "describe this"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                ],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "It is a chart."}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "explain the top-left area"}],
+            },
+        ],
+    })
+
+    assert resp.status_code == 200
+    assert captured["body"]["model"] == "mimo-v2.5"
+    assert any(
+        part.get("type") == "image_url"
+        for message in captured["body"]["messages"]
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+    )
+
+
 def test_image_request_active_model_routes_within_active_provider(client, monkeypatch):
     monkeypatch.setattr(app_module, "_proxy_running", True)
     captured = {}

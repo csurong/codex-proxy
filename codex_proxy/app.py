@@ -25,7 +25,7 @@ from .log import get_logger, setup_logging
 from .providers import (
     ProviderRuntime, ModelMeta,
     normalize_body, resolve_provider_for_model, strip_images_for_non_vision,
-    resolve_mimo_base_url, is_mimo_token_plan, body_has_images, find_image_model,
+    resolve_mimo_base_url, is_mimo_token_plan, body_has_images, latest_user_message_has_images, find_image_model,
 )
 from .translate import req_to_chat, resp_to_responses, stream_to_sse
 from .types import ResponsesRequest
@@ -298,7 +298,14 @@ async def api_log_stats():
 async def api_get_settings():
     conn = _get_conn()
     # Return all known settings
-    keys = ["log_max_rows", "log_max_age_days", "thinking_disabled", "thinking_force_high_effort", "active_model_id"]
+    keys = [
+        "log_max_rows",
+        "log_max_age_days",
+        "thinking_disabled",
+        "thinking_force_high_effort",
+        "vision_route_include_history",
+        "active_model_id",
+    ]
     return {k: get_setting(conn, k) for k in keys}
 
 
@@ -399,6 +406,7 @@ async def proxy_responses(request: Request):
     # Read thinking settings
     thinking_disabled = get_setting(conn, "thinking_disabled") == "1"
     force_high_effort = get_setting(conn, "thinking_force_high_effort") == "1"
+    vision_route_include_history = get_setting(conn, "vision_route_include_history") == "1"
 
     # Translate request
     chat_body = req_to_chat(
@@ -410,7 +418,12 @@ async def proxy_responses(request: Request):
         enable_web_search=runtime.type == "mimo" and not is_mimo_token_plan(runtime.api_key, base_url),
     )
 
-    if body_has_images(chat_body) and (not model_meta or not model_meta.supports_images):
+    image_route_needed = (
+        body_has_images(chat_body)
+        if vision_route_include_history
+        else latest_user_message_has_images(chat_body)
+    )
+    if image_route_needed and (not model_meta or not model_meta.supports_images):
         image_model = find_image_model(runtime)
         if image_model:
             target_model_id = image_model.model_id
