@@ -27,10 +27,15 @@ fn main() {
                 cmd
             } else {
                 // Release mode: use bundled binary
+                let sidecar_name = if cfg!(windows) {
+                    "codex-proxy.exe"
+                } else {
+                    "codex-proxy"
+                };
                 let sidecar_path = app.path().resource_dir()
                     .expect("Failed to resolve resource dir")
                     .join("binaries")
-                    .join("codex-proxy");
+                    .join(sidecar_name);
                 Command::new(sidecar_path)
             };
 

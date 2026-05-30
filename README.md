@@ -95,10 +95,17 @@ make test
 - Node.js 和 npm
 - Rust/Cargo
 
-构建 release 产物：
+macOS / Linux 构建 release 产物：
 
 ```bash
 make build-all
+```
+
+Windows PowerShell 构建 release 产物：
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\build-windows.ps1
 ```
 
 macOS bundle 输出目录：
@@ -107,10 +114,22 @@ macOS bundle 输出目录：
 src-tauri/target/release/bundle/
 ```
 
+Windows installer 输出目录：
+
+```text
+src-tauri\target\release\bundle\
+```
+
 Python sidecar 输出位置：
 
 ```text
 src-tauri/binaries/codex-proxy
+```
+
+Windows 下 sidecar 输出位置是：
+
+```text
+src-tauri\binaries\codex-proxy.exe
 ```
 
 ### 注意事项
@@ -214,10 +233,17 @@ Requirements:
 - Node.js and npm
 - Rust/Cargo
 
-Build all release artifacts:
+Build all release artifacts on macOS / Linux:
 
 ```bash
 make build-all
+```
+
+Build all release artifacts on Windows PowerShell:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\build-windows.ps1
 ```
 
 The macOS bundle is written under:
@@ -226,10 +252,22 @@ The macOS bundle is written under:
 src-tauri/target/release/bundle/
 ```
 
+Windows installers are written under:
+
+```text
+src-tauri\target\release\bundle\
+```
+
 The Python sidecar is built into:
 
 ```text
 src-tauri/binaries/codex-proxy
+```
+
+On Windows the sidecar is built into:
+
+```text
+src-tauri\binaries\codex-proxy.exe
 ```
 
 ### Notes
