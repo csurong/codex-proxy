@@ -96,6 +96,7 @@ async def proxy_status():
         "running": _proxy_running,
         "port": _get_cfg().port,
         "uptime": int(time.time() - _proxy_started_at) if _proxy_started_at and _proxy_running else 0,
+        "instance_id": os.environ.get("CODEX_PROXY_INSTANCE_ID"),
     }
 
 

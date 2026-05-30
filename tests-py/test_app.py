@@ -43,6 +43,15 @@ def test_get_status(client):
     assert "port" in data
 
 
+def test_status_includes_sidecar_instance_id(client, monkeypatch):
+    monkeypatch.setenv("CODEX_PROXY_INSTANCE_ID", "test-instance")
+
+    resp = client.get("/admin/api/status")
+
+    assert resp.status_code == 200
+    assert resp.json()["instance_id"] == "test-instance"
+
+
 def test_lifespan_initializes_db_when_app_is_served_directly(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "_db_conn", None)
     monkeypatch.setattr(app_module, "_config", None)

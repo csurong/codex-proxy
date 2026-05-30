@@ -84,8 +84,9 @@ def open_db(data_dir: str) -> sqlite3.Connection:
     """Open (or create) the SQLite DB, run migrations, seed builtins."""
     Path(data_dir).mkdir(parents=True, exist_ok=True)
     db_path = os.path.join(data_dir, "data.db")
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     _run_migrations(conn)
