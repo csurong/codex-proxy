@@ -6,7 +6,7 @@ use std::process::{Command, Child};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{Manager, Emitter};
+use tauri::Manager;
 
 struct Sidecar(Mutex<Option<Child>>);
 
@@ -20,7 +20,7 @@ fn main() {
         .manage(Sidecar(Mutex::new(None)))
         .setup(|app| {
             // Spawn Python sidecar
-            let sidecar_cmd = if cfg!(debug_assertions) {
+            let mut sidecar_cmd = if cfg!(debug_assertions) {
                 // Dev mode: assume Python is available directly
                 let mut cmd = Command::new("python3");
                 cmd.args(["-m", "codex_proxy.main"]);
@@ -29,6 +29,7 @@ fn main() {
                 // Release mode: use bundled binary
                 let sidecar_path = app.path().resource_dir()
                     .expect("Failed to resolve resource dir")
+                    .join("binaries")
                     .join("codex-proxy");
                 Command::new(sidecar_path)
             };
@@ -63,7 +64,8 @@ fn main() {
             // Kill sidecar on window close
             if let tauri::WindowEvent::Destroyed = event {
                 let app = window.app_handle();
-                let mut guard = app.state::<Sidecar>().0.lock().unwrap();
+                let state = app.state::<Sidecar>();
+                let mut guard = state.0.lock().unwrap();
                 if let Some(ref mut child) = *guard {
                     let _ = child.kill();
                 }

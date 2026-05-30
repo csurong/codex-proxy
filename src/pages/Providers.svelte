@@ -6,6 +6,8 @@
   let models: any[] = [];
   let settings: any = {};
   let loading = true;
+  let testingProviderId: string | null = null;
+  let providerTestResults: Record<string, string> = {};
 
   // Provider form
   let showProviderModal = false;
@@ -53,13 +55,30 @@
   }
 
   async function saveProvider() {
+    const payload = { ...pForm };
+    if (editProviderId && !payload.api_key) delete payload.api_key;
     if (editProviderId) {
-      await api.updateProvider(editProviderId, pForm);
+      await api.updateProvider(editProviderId, payload);
     } else {
-      await api.createProvider(pForm);
+      await api.createProvider(payload);
     }
     showProviderModal = false;
     await load();
+  }
+
+  async function testProvider(id: string) {
+    testingProviderId = id;
+    providerTestResults = { ...providerTestResults, [id]: "Testing..." };
+    try {
+      const result = await api.testProvider(id);
+      providerTestResults = {
+        ...providerTestResults,
+        [id]: result.ok ? `Connected: ${result.model || "ok"}` : `Failed: ${result.error || "unknown error"}`,
+      };
+    } catch (e: any) {
+      providerTestResults = { ...providerTestResults, [id]: e.message || "Failed" };
+    }
+    testingProviderId = null;
   }
 
   async function deleteProvider(id: string) {
@@ -119,12 +138,20 @@
         </div>
         <div style="display:flex;gap:6px;">
           <button class="btn btn-ghost btn-sm" on:click={() => openEditProvider(p)}>Edit</button>
+          <button class="btn btn-ghost btn-sm" on:click={() => testProvider(p.id)} disabled={testingProviderId === p.id}>
+            {testingProviderId === p.id ? "Testing..." : "Test"}
+          </button>
           <button class="btn btn-primary btn-sm" on:click={() => openAddModel(p.id)}>+ Model</button>
           {#if p.type === "custom"}
             <button class="btn btn-danger btn-sm" on:click={() => deleteProvider(p.id)}>Delete</button>
           {/if}
         </div>
       </div>
+      {#if providerTestResults[p.id]}
+        <div style="font-size:12px;color:{providerTestResults[p.id].startsWith('Connected') ? 'var(--green)' : 'var(--text-dim)'};margin-bottom:10px;">
+          {providerTestResults[p.id]}
+        </div>
+      {/if}
 
       <!-- Models table -->
       {#if modelsFor(p.id).length === 0}

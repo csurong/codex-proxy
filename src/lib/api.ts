@@ -21,6 +21,7 @@ export const api = {
   getProviders: () => request<any[]>("GET", "/providers"),
   createProvider: (data: any) => request<any>("POST", "/providers", data),
   updateProvider: (id: string, data: any) => request<any>("PATCH", `/providers/${id}`, data),
+  testProvider: (id: string) => request<any>("POST", `/providers/${id}/test`),
   deleteProvider: (id: string) => request<any>("DELETE", `/providers/${id}`),
 
   // Models
@@ -39,4 +40,5 @@ export const api = {
 
   // Test
   testConnection: (data: any) => request<any>("POST", "/test", data),
+  restoreCodexConfig: () => request<any>("POST", "/codex/restore"),
 };

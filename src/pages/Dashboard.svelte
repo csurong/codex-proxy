@@ -17,6 +17,8 @@
   let apiKeyInput = "";
   let keySaving = false;
   let keySaved = false;
+  let restoringCodex = false;
+  let codexRestoreMessage = "";
 
   onMount(async () => {
     await refresh();
@@ -87,11 +89,31 @@
     settings = { ...settings, active_model_id: modelId ? String(modelId) : "" };
   }
 
+  async function toggleSetting(key: string, enabled: boolean) {
+    const value = enabled ? "1" : "0";
+    await api.updateSettings({ [key]: value });
+    settings = { ...settings, [key]: value };
+  }
+
+  async function restoreCodexConfig() {
+    restoringCodex = true;
+    codexRestoreMessage = "";
+    try {
+      const result = await api.restoreCodexConfig();
+      codexRestoreMessage = result.message || (result.ok ? "Restored" : "Restore failed");
+    } catch (e: any) {
+      codexRestoreMessage = e.message || "Restore failed";
+    }
+    restoringCodex = false;
+  }
+
   function modelsFor(pid: string) {
     return models.filter(m => m.provider_id === pid);
   }
 
   $: filtered = showErrorsOnly ? logs.filter(l => l.status_code >= 400) : logs;
+  $: thinkingDisabled = settings?.thinking_disabled === "1";
+  $: forceHighEffort = settings?.thinking_force_high_effort === "1";
 
   function fmtDuration(ms: number) {
     if (!ms) return "-";
@@ -117,7 +139,15 @@
     <code style="background:var(--bg);padding:6px 12px;border-radius:4px;font-size:13px;display:inline-block;">
       http://127.0.0.1:{status?.port ?? 18788}/v1
     </code>
-    <div style="color:var(--text-dim);font-size:11px;margin-top:6px;">Start proxy 会自动写入 ~/.codex/config.toml</div>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;">
+      <span style="color:var(--text-dim);font-size:11px;">Start proxy 会自动写入 ~/.codex/config.toml</span>
+      <button class="btn btn-ghost btn-sm" on:click={restoreCodexConfig} disabled={restoringCodex}>
+        {restoringCodex ? "Restoring..." : "Restore Codex Config"}
+      </button>
+    </div>
+    {#if codexRestoreMessage}
+      <div style="color:var(--text-dim);font-size:11px;margin-top:6px;">{codexRestoreMessage}</div>
+    {/if}
   </div>
   <div class="card" style="grid-column: span 1;">
     <div class="card-title">API Key {#if activeProv}({activeProv.display_name || activeProv.id}){/if}</div>
@@ -149,6 +179,29 @@
         {/if}
       </div>
     {/if}
+  </div>
+  <div class="card" style="grid-column: span 1;">
+    <div class="card-title">Thinking</div>
+    <div style="display:grid;gap:10px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+        <span style="font-size:13px;color:var(--text-dim);">Disable thinking</span>
+        <button
+          type="button"
+          class="toggle {thinkingDisabled ? 'active' : ''}"
+          title="Disable provider thinking mode"
+          on:click={() => toggleSetting("thinking_disabled", !thinkingDisabled)}
+        ></button>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+        <span style="font-size:13px;color:var(--text-dim);">Force high effort</span>
+        <button
+          type="button"
+          class="toggle {forceHighEffort ? 'active' : ''}"
+          title="Use high reasoning effort when thinking is enabled"
+          on:click={() => toggleSetting("thinking_force_high_effort", !forceHighEffort)}
+        ></button>
+      </div>
+    </div>
   </div>
 </div>
 

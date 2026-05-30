@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager, suppress
 import json
 import os
+import sys
 import time
-from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from .config import Config
+from .config import Config, load_config
 from .db import (
     open_db, list_providers, get_provider, create_provider, update_provider, delete_provider,
     list_models, get_model, create_model, update_model, delete_model,
@@ -22,13 +24,13 @@ from .db import (
 from .log import get_logger, setup_logging
 from .providers import (
     ProviderRuntime, ModelMeta,
-    normalize_body, find_provider_for_model, strip_images_for_non_vision,
-    resolve_mimo_base_url,
+    normalize_body, resolve_provider_for_model, strip_images_for_non_vision,
+    resolve_mimo_base_url, is_mimo_token_plan, body_has_images, find_image_model,
 )
 from .translate import req_to_chat, resp_to_responses, stream_to_sse
 from .types import ResponsesRequest
 from .upstream import call_upstream, call_upstream_stream, UpstreamError
-from .codex_config import update_codex_proxy_url, restore_codex_backup
+from .codex_config import apply_codex_config, restore_codex_backup
 
 log = get_logger()
 
@@ -42,7 +44,9 @@ _proxy_started_at: float | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _db_conn, _config
-    _config = Config()  # Will be overridden by main.py
+    if _db_conn is None:
+        init_app(load_config())
+    mount_static()
     yield
     if _db_conn:
         _db_conn.close()
@@ -53,8 +57,10 @@ app = FastAPI(title="Codex-Proxy", lifespan=lifespan)
 
 def init_app(cfg: Config):
     """Initialize the app with config (called from main.py)."""
-    global _db_conn, _config
+    global _db_conn, _config, _proxy_running, _proxy_started_at
     _config = cfg
+    _proxy_running = False
+    _proxy_started_at = None
     os.makedirs(cfg.data_dir, exist_ok=True)
     _db_conn = open_db(cfg.data_dir)
 
@@ -71,6 +77,14 @@ def _get_cfg() -> Config:
     if _config is None:
         return Config()
     return _config
+
+
+def _public_provider(p: dict[str, Any]) -> dict[str, Any]:
+    """Return provider data safe for admin API responses."""
+    p = dict(p)
+    api_key = p.pop("api_key", None)
+    p["api_key_preview"] = api_key[:6] + "***" if api_key else None
+    return p
 
 
 # ── Admin API: Proxy control ──
@@ -93,7 +107,33 @@ async def proxy_start():
     cfg = _get_cfg()
     proxy_url = f"http://{cfg.host}:{cfg.port}/v1"
     try:
-        codex_result = update_codex_proxy_url(proxy_url)
+        conn = _get_conn()
+        provider = get_provider(conn, "mimo")
+        model = None
+        active_model_id = get_setting(conn, "active_model_id")
+        if active_model_id:
+            try:
+                active_model = get_model(conn, int(active_model_id))
+                if active_model:
+                    model = active_model
+                    provider = get_provider(conn, active_model["provider_id"])
+            except (ValueError, TypeError):
+                pass
+        if model is None:
+            models = list_models(conn, provider["id"] if provider else "mimo")
+            model = models[0] if models else None
+        if provider and model:
+            codex_result = apply_codex_config(
+                proxy_url,
+                provider_key=provider["id"],
+                provider_name=provider["display_name"],
+                model_id=model["model_id"],
+                context_window=model.get("context_window"),
+                max_output_tokens=model.get("max_output_tokens"),
+                supports_reasoning=bool(model.get("supports_reasoning")),
+            )
+        else:
+            codex_result = {"changed": False, "message": "No provider/model available for Codex config"}
     except Exception as e:
         codex_result = {"changed": False, "message": f"Could not update Codex config: {e}"}
     return {"ok": True, "message": "Proxy started", "proxy_url": proxy_url, "codex_config": codex_result}
@@ -114,14 +154,11 @@ async def api_list_providers():
     conn = _get_conn()
     providers = list_providers(conn)
     # Attach model count
+    result = []
     for p in providers:
         p["model_count"] = len(list_models(conn, p["id"]))
-        # Don't expose api_key in full
-        if p.get("api_key"):
-            p["api_key_preview"] = p["api_key"][:6] + "***"
-        else:
-            p["api_key_preview"] = None
-    return providers
+        result.append(_public_provider(p))
+    return result
 
 
 @app.post("/admin/api/providers")
@@ -147,7 +184,7 @@ async def api_create_provider(request: Request):
             "api_key": data.get("api_key"),
             "config": data.get("config", {}),
         })
-        return p
+        return _public_provider(p)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
@@ -156,10 +193,37 @@ async def api_create_provider(request: Request):
 async def api_update_provider(provider_id: str, request: Request):
     data = await request.json()
     conn = _get_conn()
+    if data.get("api_key") == "":
+        data = {k: v for k, v in data.items() if k != "api_key"}
     p = update_provider(conn, provider_id, data)
     if not p:
         return JSONResponse({"error": "Provider not found"}, status_code=404)
-    return p
+    return _public_provider(p)
+
+
+@app.post("/admin/api/providers/{provider_id}/test")
+async def api_test_provider(provider_id: str):
+    conn = _get_conn()
+    provider = get_provider(conn, provider_id)
+    if not provider:
+        return JSONResponse({"ok": False, "error": "Provider not found"}, status_code=404)
+
+    runtime = ProviderRuntime.from_db_row(provider, list_models(conn, provider_id))
+    base_url = runtime.base_url
+    if runtime.type == "mimo":
+        base_url = resolve_mimo_base_url(runtime.api_key, base_url)
+    if not base_url:
+        return JSONResponse({"ok": False, "error": "base_url required"}, status_code=400)
+
+    model = runtime.models[0].model_id if runtime.models else "test"
+    try:
+        body = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 5}
+        resp = await call_upstream(base_url, runtime.api_key, body, timeout=10)
+        return {"ok": True, "model": resp.model or model, "status": "connected"}
+    except UpstreamError as e:
+        return {"ok": False, "error": f"HTTP {e.status_code}: {e.message[:200]}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
 
 
 @app.delete("/admin/api/providers/{provider_id}")
@@ -286,6 +350,9 @@ async def proxy_responses(request: Request):
     except Exception as e:
         return JSONResponse({"error": f"Invalid request: {e}"}, status_code=400)
 
+    if not _proxy_running:
+        return JSONResponse({"error": "Proxy is stopped"}, status_code=503)
+
     # Resolve provider
     providers_data = list_providers(conn)
     runtimes = []
@@ -305,16 +372,21 @@ async def proxy_responses(request: Request):
     if active_model:
         # Route to the active model's provider regardless of req.model
         target_model_id = active_model["model_id"]
-        try:
-            runtime, model_meta = find_provider_for_model(runtimes, target_model_id)
-        except ValueError:
-            return JSONResponse({"error": f"Active model '{target_model_id}' not found in any provider"}, status_code=400)
+        runtime = next((p for p in runtimes if p.id == active_model["provider_id"]), None)
+        if not runtime:
+            return JSONResponse(
+                {"error": f"Active model provider '{active_model['provider_id']}' not found"},
+                status_code=400,
+            )
+        model_meta = next((m for m in runtime.models if m.model_id == target_model_id), None)
     else:
-        target_model_id = req.model
         try:
-            runtime, model_meta = find_provider_for_model(runtimes, req.model)
+            selection = resolve_provider_for_model(runtimes, req.model)
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=404)
+        runtime = selection.provider
+        model_meta = selection.model_meta
+        target_model_id = selection.model_id
 
     # Resolve base_url (MiMo auto-detect)
     base_url = runtime.base_url
@@ -324,8 +396,26 @@ async def proxy_responses(request: Request):
     if not base_url:
         return JSONResponse({"error": f"No base_url configured for provider '{runtime.id}'"}, status_code=400)
 
+    # Read thinking settings
+    thinking_disabled = get_setting(conn, "thinking_disabled") == "1"
+    force_high_effort = get_setting(conn, "thinking_force_high_effort") == "1"
+
     # Translate request
-    chat_body = req_to_chat(req, cfg.expose_reasoning)
+    chat_body = req_to_chat(
+        req,
+        expose_reasoning=cfg.expose_reasoning,
+        stream=req.stream,
+        thinking_disabled=thinking_disabled,
+        force_high_effort=force_high_effort,
+        enable_web_search=runtime.type == "mimo" and not is_mimo_token_plan(runtime.api_key, base_url),
+    )
+
+    if body_has_images(chat_body) and (not model_meta or not model_meta.supports_images):
+        image_model = find_image_model(runtime)
+        if image_model:
+            target_model_id = image_model.model_id
+            model_meta = image_model
+
     # Override model in request body with the target model
     chat_body["model"] = target_model_id
 
@@ -334,7 +424,7 @@ async def proxy_responses(request: Request):
         chat_body["messages"] = strip_images_for_non_vision(chat_body["messages"], model_meta)
 
     # Provider normalization
-    chat_body = normalize_body(runtime, chat_body, target_model_id)
+    chat_body = normalize_body(runtime, chat_body, target_model_id, thinking_on=False if thinking_disabled else None)
 
     start = time.time()
     log_entry: dict[str, Any] = {
@@ -383,15 +473,58 @@ async def _handle_stream(req, runtime, base_url, chat_body, cfg, start, log_entr
             yield chunk
     peeked_chunks = _peek_model(chunks)
 
-    async def generate():
-        async for sse_line in stream_to_sse(peeked_chunks, req, cfg.expose_reasoning):
-            yield sse_line
+    stream_usage: dict[str, int] = {}
 
-    # Log after stream completes (we can't easily get usage from streaming)
-    log_entry["status_code"] = 200
-    log_entry["duration_ms"] = int((time.time() - start) * 1000)
-    log_entry["upstream_model"] = first_chunk_model
-    insert_chat_log(_get_conn(), log_entry)
+    async def generate():
+        keepalive_interval = 15.0
+        queue: asyncio.Queue[tuple[str, str | BaseException | None]] = asyncio.Queue()
+
+        async def produce():
+            try:
+                async for sse_line in stream_to_sse(peeked_chunks, req, cfg.expose_reasoning, usage_out=stream_usage):
+                    await queue.put(("event", sse_line))
+            except Exception as e:
+                await queue.put(("error", e))
+            finally:
+                await queue.put(("done", None))
+
+        producer = asyncio.create_task(produce())
+
+        try:
+            while True:
+                try:
+                    kind, payload = await asyncio.wait_for(queue.get(), timeout=keepalive_interval)
+                except asyncio.TimeoutError:
+                    # Send keepalive comment without cancelling the upstream stream.
+                    yield ": keepalive\n\n"
+                    continue
+
+                if kind == "event":
+                    yield payload  # type: ignore[misc]
+                    continue
+                if kind == "error":
+                    raise payload  # type: ignore[misc]
+                break
+        finally:
+            if not producer.done():
+                producer.cancel()
+                with suppress(asyncio.CancelledError):
+                    await producer
+
+        if producer.done() and not producer.cancelled():
+            try:
+                producer.result()
+            except Exception:
+                raise
+
+        # Log after stream is fully consumed by the client
+        log_entry["status_code"] = 200
+        log_entry["duration_ms"] = int((time.time() - start) * 1000)
+        log_entry["upstream_model"] = first_chunk_model
+        if stream_usage:
+            log_entry["prompt_tokens"] = stream_usage.get("prompt_tokens")
+            log_entry["completion_tokens"] = stream_usage.get("completion_tokens")
+        insert_chat_log(_get_conn(), log_entry)
 
     return StreamingResponse(
         generate(),
@@ -448,7 +581,10 @@ async def api_restore_codex():
 
 def mount_static():
     """Mount static file serving for the admin UI. Call after all routes."""
-    static_dir = Path(__file__).parent.parent / "static"
+    if any(getattr(route, "path", None) in ("/admin", "/admin/{path:path}") for route in app.routes):
+        return
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).parent.parent))
+    static_dir = bundle_root / "static"
     if static_dir.is_dir():
         app.mount("/admin", StaticFiles(directory=str(static_dir), html=True), name="admin")
     else:
@@ -462,4 +598,3 @@ def mount_static():
                 "<p>API available at <a href='/admin/api/status'>/admin/api/status</a></p>"
                 "</body></html>"
             )
-

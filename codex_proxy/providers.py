@@ -58,6 +58,16 @@ class ProviderRuntime:
         )
 
 
+@dataclass
+class ProviderSelection:
+    provider: ProviderRuntime
+    model_id: str
+    request_model: str
+    model_meta: ModelMeta | None = None
+    rewritten: bool = False
+    reason: str | None = None
+
+
 # ── Provider-specific normalization ──
 
 
@@ -76,17 +86,34 @@ def resolve_mimo_base_url(api_key: str | None, configured_url: str) -> str:
     return MIMO_PAYG_URL
 
 
+def is_mimo_token_plan(api_key: str | None, base_url: str) -> bool:
+    """Return whether a MiMo runtime is using the token-plan host."""
+    return bool((api_key or "").startswith("tp-") or "token-plan" in (base_url or "").lower())
+
+
 def normalize_mimo(body: dict[str, Any], model_id: str, thinking_on: bool | None) -> dict[str, Any]:
     """Apply MiMo-specific normalization to Chat Completions request body."""
     if thinking_on is None:
-        thinking_on = model_id not in MIMO_THINKING_DISABLED_MODELS
+        thinking = body.get("thinking")
+        if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+            thinking_on = False
+        elif isinstance(thinking, dict) and thinking.get("type") == "enabled":
+            thinking_on = True
+        else:
+            thinking_on = model_id not in MIMO_THINKING_DISABLED_MODELS
 
     if thinking_on:
         body["thinking"] = {"type": "enabled"}
         # MiMo forces temperature=1.0 in thinking mode; strip user value
         body.pop("temperature", None)
+        body.pop("top_p", None)
+        # Strip tool_choice when not "auto" — MiMo rejects non-auto in thinking mode
+        if body.get("tool_choice") and body["tool_choice"] != "auto":
+            body.pop("tool_choice", None)
     else:
         body["thinking"] = {"type": "disabled"}
+        # Strip reasoning_effort when thinking is disabled
+        body.pop("reasoning_effort", None)
 
     # MiMo uses max_completion_tokens, not max_tokens
     if "max_tokens" in body:
@@ -127,7 +154,118 @@ def normalize_body(
         return normalize_custom(body)
 
 
+def body_has_images(body: dict[str, Any]) -> bool:
+    """Return whether a Chat Completions body contains image_url content."""
+    for message in body.get("messages", []):
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                return True
+    return False
+
+
+def find_image_model(provider: ProviderRuntime) -> ModelMeta | None:
+    """Pick the first image-capable model declared for this provider."""
+    return next((m for m in provider.models if m.supports_images), None)
+
+
 # ── Provider selection ──
+
+
+def _provider_priority(providers: list[ProviderRuntime]) -> list[ProviderRuntime]:
+    """Prefer user-configured local/custom providers over built-in MiMo models."""
+    return [p for p in providers if p.type != "mimo"] + [p for p in providers if p.type == "mimo"]
+
+
+def _find_model(provider: ProviderRuntime, model_id: str) -> ModelMeta | None:
+    return next((m for m in provider.models if m.model_id == model_id), None)
+
+
+def _aliases(provider: ProviderRuntime) -> dict[str, str]:
+    aliases = provider.config.get("aliases")
+    if not isinstance(aliases, dict):
+        return {}
+    return {str(k): str(v) for k, v in aliases.items() if k and v}
+
+
+def resolve_provider_for_model(
+    providers: list[ProviderRuntime],
+    model_id: str,
+) -> ProviderSelection:
+    """Resolve a client model name to the provider and upstream model to call.
+
+    Resolution order:
+    1. Provider aliases, preferring user-configured providers over built-in MiMo.
+    2. Exact model match, with the same provider priority.
+    3. Provider ID prefix (for example, "vllm/qwq-32b" -> provider "vllm").
+    4. First provider with a declared model, rewriting unknown model names to it.
+    5. First provider with the original model when no model catalog exists.
+    """
+    ordered = _provider_priority(providers)
+
+    for provider in ordered:
+        alias_target = _aliases(provider).get(model_id)
+        if alias_target:
+            return ProviderSelection(
+                provider=provider,
+                model_id=alias_target,
+                request_model=model_id,
+                model_meta=_find_model(provider, alias_target),
+                rewritten=alias_target != model_id,
+                reason="alias",
+            )
+
+    for provider in ordered:
+        meta = _find_model(provider, model_id)
+        if meta:
+            return ProviderSelection(
+                provider=provider,
+                model_id=model_id,
+                request_model=model_id,
+                model_meta=meta,
+                rewritten=False,
+                reason="exact",
+            )
+
+    if "/" in model_id:
+        prefix, tail = model_id.split("/", 1)
+        for provider in providers:
+            if provider.id != prefix:
+                continue
+            alias_target = _aliases(provider).get(tail, tail)
+            return ProviderSelection(
+                provider=provider,
+                model_id=alias_target,
+                request_model=model_id,
+                model_meta=_find_model(provider, alias_target),
+                rewritten=alias_target != model_id,
+                reason="provider_prefix",
+            )
+
+    for provider in providers:
+        if provider.models:
+            target = provider.models[0].model_id
+            return ProviderSelection(
+                provider=provider,
+                model_id=target,
+                request_model=model_id,
+                model_meta=provider.models[0],
+                rewritten=target != model_id,
+                reason="fallback",
+            )
+
+    if providers:
+        return ProviderSelection(
+            provider=providers[0],
+            model_id=model_id,
+            request_model=model_id,
+            rewritten=False,
+            reason="fallback",
+        )
+
+    raise ValueError(f"No provider found for model '{model_id}'")
 
 
 def find_provider_for_model(
@@ -136,29 +274,10 @@ def find_provider_for_model(
 ) -> tuple[ProviderRuntime, ModelMeta | None]:
     """Find the provider and model metadata for a given model ID.
 
-    Checks in order:
-    1. Exact match in any provider's model list
-    2. Provider ID prefix (e.g., "mimo/mimo-v2.5-pro" → provider "mimo")
-    3. First provider (fallback)
+    Compatibility wrapper around resolve_provider_for_model().
     """
-    # 1. Exact model match (only enabled models)
-    for p in providers:
-        for m in p.models:
-            if m.model_id == model_id:
-                return p, m
-
-    # 2. Provider prefix
-    if "/" in model_id:
-        prefix = model_id.split("/", 1)[0]
-        for p in providers:
-            if p.id == prefix:
-                return p, None
-
-    # 3. Fallback to first provider
-    if providers:
-        return providers[0], None
-
-    raise ValueError(f"No provider found for model '{model_id}'")
+    selection = resolve_provider_for_model(providers, model_id)
+    return selection.provider, selection.model_meta
 
 
 def strip_images_for_non_vision(

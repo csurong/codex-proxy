@@ -75,7 +75,10 @@ def _warn_once(tool_type: str, msg: str) -> None:
         log.warning(msg)
 
 
-def _tool_to_chat(t: Any) -> dict[str, Any] | list[dict[str, Any]] | None:
+def _tool_to_chat(
+    t: Any,
+    enable_web_search: bool = False,
+) -> dict[str, Any] | list[dict[str, Any]] | None:
     """Convert a single Responses API tool to Chat Completions tool(s), or None to drop."""
     # Normalize to dict — accept both raw dicts and Pydantic models
     if hasattr(t, "model_dump"):
@@ -104,8 +107,14 @@ def _tool_to_chat(t: Any) -> dict[str, Any] | list[dict[str, Any]] | None:
     if tool_type == "local_shell":
         return _LOCAL_SHELL_FN
 
-    # 3. web_search / web_search_preview → drop (no upstream equivalent unless provider-specific)
+    # 3. web_search / web_search_preview → MiMo native builtin when enabled
     if tool_type in ("web_search", "web_search_preview"):
+        if enable_web_search:
+            tool: dict[str, Any] = {"type": "web_search"}
+            for key in ("user_location", "max_keyword", "force_search", "limit"):
+                if key in t:
+                    tool[key] = t[key]
+            return tool
         log.debug("dropping tool type %r — no upstream equivalent", tool_type)
         return None
 
@@ -142,7 +151,7 @@ def _tool_to_chat(t: Any) -> dict[str, Any] | list[dict[str, Any]] | None:
             return None
         result: list[dict[str, Any]] = []
         for inner in nested_tools:
-            r = _tool_to_chat(inner)
+            r = _tool_to_chat(inner, enable_web_search=enable_web_search)
             if isinstance(r, list):
                 result.extend(r)
             elif r is not None:
@@ -174,7 +183,91 @@ def _tool_to_chat(t: Any) -> dict[str, Any] | list[dict[str, Any]] | None:
     return None
 
 
-def req_to_chat(req: ResponsesRequest, expose_reasoning: bool = True) -> dict[str, Any]:
+# ── MCP connector advisory ──
+
+_MCP_CONNECTOR_HINTS: list[tuple[str, str]] = [
+    ("github", "`gh` (GitHub CLI: https://cli.github.com)"),
+    ("gmail", "`rclone` or Google's official CLI tools"),
+    ("google", "`rclone` or Google's official CLI tools"),
+    ("dropbox", "`rclone` or the `dropbox` CLI"),
+    ("canva", "their REST API via `curl`"),
+    ("heygen", "their REST API via `curl`"),
+]
+
+
+def _collect_mcp_labels(tools: list[Any] | None) -> list[str]:
+    """Collect labels from first-party MCP connector tools."""
+    if not tools:
+        return []
+    labels: list[str] = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        if t.get("type") != "mcp":
+            continue
+        if t.get("connector_id"):
+            labels.append(t.get("server_label") or t["connector_id"])
+    return labels
+
+
+def _build_mcp_advisory(labels: list[str]) -> str:
+    """Build a system prompt advisory about unavailable MCP connectors."""
+    label_list = ", ".join(f'"{l}"' for l in labels)
+    hint_lines: list[str] = []
+    seen: set[str] = set()
+    for label in labels:
+        for pattern, hint in _MCP_CONNECTOR_HINTS:
+            if pattern in label.lower() and hint not in seen:
+                seen.add(hint)
+                hint_lines.append(f"  - for {label}: {hint}")
+    hints = ""
+    if hint_lines:
+        hints = "\nSuggested command-line alternatives:\n" + "\n".join(hint_lines)
+    return (
+        f"Note from the codex-proxy: the user has the following connector plugin(s) "
+        f"enabled — {label_list} — but these are NOT available through this proxy. "
+        f"If the user requests functionality from one of these connectors, "
+        f"suggest they use a shell command-line equivalent instead.{hints}"
+    )
+
+
+def _tool_choice_to_chat(tc: str | dict[str, Any]) -> str | dict[str, Any]:
+    """Convert Responses API tool_choice to Chat Completions format."""
+    if isinstance(tc, str):
+        return tc
+    # Responses API: { type: "function", name: "..." }
+    # Chat Completions: { type: "function", function: { name: "..." } }
+    if isinstance(tc, dict) and tc.get("type") == "function":
+        name = tc.get("name", "")
+        if name:
+            return {"type": "function", "function": {"name": name}}
+    return tc
+
+
+def _dedupe_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate tools by name. First occurrence wins."""
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for t in tools:
+        name = t.get("function", {}).get("name") or t.get("name", "")
+        if not name and t.get("type") != "function":
+            name = f"builtin:{t.get('type', '')}"
+        if name and name in seen:
+            continue
+        if name:
+            seen.add(name)
+        result.append(t)
+    return result
+
+
+def req_to_chat(
+    req: ResponsesRequest,
+    expose_reasoning: bool = True,
+    stream: bool = False,
+    thinking_disabled: bool = False,
+    force_high_effort: bool = False,
+    enable_web_search: bool = False,
+) -> dict[str, Any]:
     """Convert a ResponsesRequest to a Chat Completions request body dict."""
     messages: list[dict[str, Any]] = []
 
@@ -188,28 +281,46 @@ def req_to_chat(req: ResponsesRequest, expose_reasoning: bool = True) -> dict[st
     elif isinstance(req.input, list):
         messages.extend(_process_input_list(req.input))
 
-    # 3. Convert tools
+    # 3. Collect MCP connector labels before dropping them
+    mcp_labels = _collect_mcp_labels(req.tools)
+    if mcp_labels:
+        advisory = _build_mcp_advisory(mcp_labels)
+        messages.insert(0 if not req.instructions else 1, {"role": "system", "content": advisory})
+
+    # 3.5. Backfill reasoning_content for mixed-mode thinking
+    if not thinking_disabled:
+        backfill_reasoning_content(messages)
+
+    # 4. Convert tools
     tools = None
     if req.tools:
         tools = []
         for t in req.tools:
-            result = _tool_to_chat(t)
+            result = _tool_to_chat(t, enable_web_search=enable_web_search)
             if isinstance(result, list):
                 tools.extend(result)
             elif result is not None:
                 tools.append(result)
+        tools = _dedupe_tools(tools)
 
-    # 4. Build body
+    # 5. Build body
     body: dict[str, Any] = {
         "model": req.model,
         "messages": messages,
-        "stream": req.stream,
+        "stream": stream,
     }
 
     if tools:
         body["tools"] = tools
+
+    # tool_choice conversion
     if req.tool_choice != "auto":
-        body["tool_choice"] = req.tool_choice
+        body["tool_choice"] = _tool_choice_to_chat(req.tool_choice)
+
+    # parallel_tool_calls
+    if not req.parallel_tool_calls:
+        body["parallel_tool_calls"] = False
+
     if req.temperature is not None:
         body["temperature"] = req.temperature
     if req.top_p is not None:
@@ -217,12 +328,47 @@ def req_to_chat(req: ResponsesRequest, expose_reasoning: bool = True) -> dict[st
     if req.max_output_tokens is not None:
         body["max_completion_tokens"] = req.max_output_tokens
 
-    # 5. Reasoning effort → reasoning_effort
+    # 6. Reasoning effort → reasoning_effort
     if req.reasoning and req.reasoning.effort:
         effort = req.reasoning.effort
         body["reasoning_effort"] = "low" if effort == "minimal" else effort
+    elif force_high_effort and not thinking_disabled:
+        body["reasoning_effort"] = "high"
+
+    # 7. Stream options for usage reporting
+    if stream:
+        body["stream_options"] = {"include_usage": True}
+
+    # 8. disableThinking
+    if thinking_disabled:
+        body["thinking"] = {"type": "disabled"}
 
     return body
+
+
+def _tool_output_to_str(output: Any) -> str:
+    """Convert function_call_output.output to a string.
+
+    Handles str, dict (JSON), and list (content parts with possible images).
+    """
+    if isinstance(output, str):
+        return output
+    if isinstance(output, dict):
+        return json.dumps(output)
+    if isinstance(output, list):
+        parts: list[str] = []
+        for p in output:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict):
+                if p.get("type") in ("text", "input_text", "output_text"):
+                    parts.append(p.get("text", ""))
+                elif p.get("type") == "input_image":
+                    parts.append("[image]")
+                else:
+                    parts.append(json.dumps(p))
+        return "\n".join(parts) if parts else ""
+    return str(output)
 
 
 def _process_input_list(items: list[Any]) -> list[dict[str, Any]]:
@@ -235,6 +381,23 @@ def _process_input_list(items: list[Any]) -> list[dict[str, Any]]:
         if isinstance(item, str):
             messages.append({"role": "user", "content": item})
             continue
+
+        # Legacy Chat Completions compatibility: {role, content} without type
+        # Skip assistant messages — they need special handling for reasoning/attachment
+        if isinstance(item, dict) and "type" not in item and "role" in item and item["role"] != "assistant":
+            role = item["role"]
+            content = item.get("content", "")
+            if isinstance(content, list):
+                text = "".join(
+                    p.get("text", "") if isinstance(p, dict) else str(p)
+                    for p in content
+                )
+            else:
+                text = str(content) if content else ""
+            if text:
+                messages.append({"role": role, "content": text})
+            continue
+
         if not isinstance(item, dict):
             continue
 
@@ -258,13 +421,11 @@ def _process_input_list(items: list[Any]) -> list[dict[str, Any]]:
         # Function call output → tool message
         if item_type == "function_call_output":
             call_id = item.get("call_id", "")
-            output = item.get("output", "")
-            if isinstance(output, dict):
-                output = json.dumps(output)
+            output = _tool_output_to_str(item.get("output", ""))
             messages.append({
                 "role": "tool",
                 "tool_call_id": call_id,
-                "content": str(output),
+                "content": output,
             })
             continue
 
@@ -322,11 +483,18 @@ def _process_input_list(items: list[Any]) -> list[dict[str, Any]]:
                 for p in content:
                     if isinstance(p, dict):
                         if p.get("type") in ("input_text", "output_text"):
+                            # Defensive: coerce malformed text to string, drop empties
                             text = p.get("text", "")
+                            if not isinstance(text, str):
+                                text = str(text) if text else ""
                             if text:
                                 parts.append({"type": "text", "text": text})
                         elif p.get("type") == "text":
-                            parts.append(p)
+                            text = p.get("text", "")
+                            if not isinstance(text, str):
+                                text = str(text) if text else ""
+                            if text:
+                                parts.append({"type": "text", "text": text})
                         elif p.get("type") == "input_image":
                             # Responses API → Chat Completions image_url format
                             img_url = p.get("image_url", "")
@@ -337,6 +505,9 @@ def _process_input_list(items: list[Any]) -> list[dict[str, Any]]:
                                 parts.append(part)
                         elif p.get("type") == "image_url":
                             parts.append(p)
+                        elif p.get("type") == "input_file":
+                            log.debug("dropping input_file content part (not supported upstream)")
+                            continue
                     elif isinstance(p, str):
                         parts.append({"type": "text", "text": p})
                 if parts:
@@ -368,7 +539,78 @@ def _process_input_list(items: list[Any]) -> list[dict[str, Any]]:
             msg.pop("content", None)
         messages.append(msg)
 
+    # Post-processing: clean up tool message invariants
+    _remove_orphan_tool_messages(messages)
+    _ensure_tool_calls_have_outputs(messages)
+
     return messages
+
+
+def _remove_orphan_tool_messages(messages: list[dict[str, Any]]) -> None:
+    """Remove tool messages whose tool_call_id has no matching assistant.tool_calls."""
+    # First pass: collect all tool_call_ids declared by assistant messages
+    declared_ids: set[str] = set()
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                if tc.get("id"):
+                    declared_ids.add(tc["id"])
+
+    # Second pass: remove tool messages that reference undeclared tool_call_ids
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        if m.get("role") == "tool":
+            tc_id = m.get("tool_call_id")
+            if tc_id and tc_id in declared_ids:
+                i += 1
+            else:
+                log.debug("dropping orphan tool message: tool_call_id=%s", tc_id)
+                messages.pop(i)
+        else:
+            i += 1
+
+
+def _ensure_tool_calls_have_outputs(messages: list[dict[str, Any]]) -> None:
+    """Synthesize placeholder tool messages for assistant.tool_calls missing outputs."""
+    # Collect all tool_call_ids that have outputs anywhere in the message list
+    output_ids: set[str] = set()
+    for m in messages:
+        if m.get("role") == "tool" and m.get("tool_call_id"):
+            output_ids.add(m["tool_call_id"])
+
+    # Insert placeholders for missing outputs right after the assistant message
+    insertions: list[tuple[int, dict[str, Any]]] = []
+    for i, m in enumerate(messages):
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                tc_id = tc.get("id")
+                if tc_id and tc_id not in output_ids:
+                    insertions.append((i + 1, {
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": "(tool output missing — call was interrupted or cancelled)",
+                    }))
+                    output_ids.add(tc_id)
+
+    # Insert in reverse order to preserve indices
+    for idx, msg in reversed(insertions):
+        messages.insert(idx, msg)
+
+
+def backfill_reasoning_content(messages: list[dict[str, Any]]) -> None:
+    """When thinking is ON but historical assistant messages lack reasoning_content,
+    backfill a placeholder so upstream doesn't 400 with 'reasoning_content must be passed back'."""
+    has_reasoning = any(
+        m.get("role") == "assistant" and m.get("reasoning_content")
+        for m in messages
+    )
+    if not has_reasoning:
+        return  # thinking was never ON, no backfill needed
+
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls") and not m.get("reasoning_content"):
+            m["reasoning_content"] = "(reasoning not available for this turn)"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -465,13 +707,19 @@ async def stream_to_sse(
     chunks: AsyncIterator[ChatStreamChunk],
     req: ResponsesRequest,
     expose_reasoning: bool = True,
+    usage_out: dict[str, Any] | None = None,
 ) -> AsyncIterator[str]:
-    """Convert streaming Chat Completions chunks to Responses API SSE event strings."""
+    """Convert streaming Chat Completions chunks to Responses API SSE event strings.
+
+    If *usage_out* is provided, it will be mutated in-place with
+    ``{"prompt_tokens": int, "completion_tokens": int}`` when the upstream
+    sends usage data (typically on the final chunk).
+    """
     state = _StreamState(req.model, expose_reasoning)
 
     # response.created + response.in_progress
-    yield sse_event("response.created", {"response": _build_snapshot(state, req, "in_progress")})
-    yield sse_event("response.in_progress", {"response": _build_snapshot(state, req, "in_progress")})
+    yield sse_event("response.created", {"response": _build_snapshot(state, req, "in_progress")}, state.next_seq())
+    yield sse_event("response.in_progress", {"response": _build_snapshot(state, req, "in_progress")}, state.next_seq())
 
     try:
         async for chunk in chunks:
@@ -495,7 +743,7 @@ async def stream_to_sse(
                         "output_index": state.output_index - 1,
                         "summary_index": 0,
                         "delta": delta.reasoning_content,
-                    })
+                    }, state.next_seq())
 
             # Message content
             if delta.content:
@@ -509,7 +757,7 @@ async def stream_to_sse(
                     "output_index": state.output_index - 1,
                     "content_index": 0,
                     "delta": delta.content,
-                })
+                }, state.next_seq())
 
             # Annotations
             if delta.annotations:
@@ -524,7 +772,7 @@ async def stream_to_sse(
                         "content_index": 0,
                         "annotation_index": idx,
                         "annotation": ann,
-                    })
+                    }, state.next_seq())
 
             # Tool calls
             if delta.tool_calls:
@@ -549,7 +797,7 @@ async def stream_to_sse(
                                 "arguments": "",
                                 "status": "in_progress",
                             },
-                        })
+                        }, state.next_seq())
                         state.output_index += 1
 
                     tc = state.tool_calls[tc_idx]
@@ -561,7 +809,7 @@ async def stream_to_sse(
                             "item_id": tc["item_id"],
                             "output_index": tc["output_index"],
                             "delta": tc_delta["function"]["arguments"],
-                        })
+                        }, state.next_seq())
 
             # Finish reason
             if choice.finish_reason:
@@ -573,15 +821,20 @@ async def stream_to_sse(
 
     except Exception as e:
         # Error: emit response.failed
-        for e in _finalize_all(state): yield e
+        for ev in _finalize_all(state): yield ev
         snapshot = _build_snapshot(state, req, "failed")
         snapshot["error"] = {"type": "upstream_error", "message": str(e)}
-        yield sse_event("response.failed", {"response": snapshot})
+        yield sse_event("response.failed", {"response": snapshot}, state.next_seq())
         return
 
     # Normal completion
-    for e in _finalize_all(state): yield e
-    yield sse_event("response.completed", {"response": _build_snapshot(state, req, "completed")})
+    for ev in _finalize_all(state): yield ev
+    yield sse_event("response.completed", {"response": _build_snapshot(state, req, "completed")}, state.next_seq())
+
+    # Write usage back to caller if requested
+    if usage_out is not None and state.usage:
+        usage_out["prompt_tokens"] = state.usage.input_tokens
+        usage_out["completion_tokens"] = state.usage.output_tokens
 
 
 # ── Stream state machine ──
@@ -628,14 +881,14 @@ def _open_reasoning(state: _StreamState):
             "encrypted_content": None,
             "status": "in_progress",
         },
-    })
+    }, state.next_seq())
     if state.expose_reasoning:
         yield sse_event("response.reasoning_summary_part.added", {
             "item_id": state.active_item_id,
             "output_index": idx,
             "summary_index": 0,
             "part": {"type": "summary_text", "text": ""},
-        })
+        }, state.next_seq())
 
 
 def _close_reasoning(state: _StreamState):
@@ -650,13 +903,14 @@ def _close_reasoning(state: _StreamState):
             "item_id": state.active_item_id,
             "output_index": idx,
             "summary_index": 0,
-        })
+            "text": buf,
+        }, state.next_seq())
         yield sse_event("response.reasoning_summary_part.done", {
             "item_id": state.active_item_id,
             "output_index": idx,
             "summary_index": 0,
             "part": {"type": "summary_text", "text": buf},
-        })
+        }, state.next_seq())
 
     yield sse_event("response.output_item.done", {
         "output_index": idx,
@@ -667,7 +921,7 @@ def _close_reasoning(state: _StreamState):
             "encrypted_content": buf,
             "status": "completed",
         },
-    })
+    }, state.next_seq())
     state.active_kind = None
     state.active_item_id = None
     state.active_buffer = ""
@@ -693,7 +947,13 @@ def _open_message(state: _StreamState):
             "content": [],
             "status": "in_progress",
         },
-    })
+    }, state.next_seq())
+    yield sse_event("response.content_part.added", {
+        "item_id": state.active_item_id,
+        "output_index": idx,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": ""},
+    }, state.next_seq())
 
 
 def _close_message(state: _StreamState):
@@ -701,12 +961,18 @@ def _close_message(state: _StreamState):
     if state.active_kind != "message":
         return
     idx = state.output_index - 1
+    yield sse_event("response.content_part.done", {
+        "item_id": state.active_item_id,
+        "output_index": idx,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": state.active_buffer},
+    }, state.next_seq())
     yield sse_event("response.output_text.done", {
         "item_id": state.active_item_id,
         "output_index": idx,
         "content_index": 0,
         "text": state.active_buffer,
-    })
+    }, state.next_seq())
     yield sse_event("response.output_item.done", {
         "output_index": idx,
         "item": {
@@ -716,7 +982,7 @@ def _close_message(state: _StreamState):
             "status": "completed",
             "content": [{"type": "output_text", "text": state.active_buffer, "annotations": state.annotations}],
         },
-    })
+    }, state.next_seq())
     state.active_kind = None
     state.active_item_id = None
     state.active_buffer = ""
@@ -736,7 +1002,7 @@ def _finalize_tool_calls(state: _StreamState):
         yield sse_event("response.function_call_arguments.done", {
             "item_id": tc["item_id"],
             "output_index": tc["output_index"],
-        })
+        }, state.next_seq())
         yield sse_event("response.output_item.done", {
             "output_index": tc["output_index"],
             "item": {
@@ -747,7 +1013,7 @@ def _finalize_tool_calls(state: _StreamState):
                 "arguments": tc["args_buffer"],
                 "status": "completed",
             },
-        })
+        }, state.next_seq())
 
 
 def _finalize_all(state: _StreamState):

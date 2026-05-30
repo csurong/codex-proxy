@@ -18,10 +18,10 @@ build-web:
 	npm run build
 
 build-py:
-	.venv/bin/pyinstaller --onefile --name codex-proxy --distpath src-tauri/binaries codex_proxy/main.py
+	PYINSTALLER_CONFIG_DIR=build/pyinstaller-config .venv/bin/pyinstaller --clean --onefile --name codex-proxy --distpath src-tauri/binaries --add-data "static:static" codex_proxy_launcher.py
 
 build-desktop:
-	cargo tauri build
+	npm run tauri build
 
 build-all: build-web build-py build-desktop
 

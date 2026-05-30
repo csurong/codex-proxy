@@ -2,6 +2,16 @@
   "name": "codex-proxy",
   "private": true,
   "version": "0.1.0",
+  "license": "MIT",
+  "author": "csurong",
+  "homepage": "https://github.com/csurong/codex-proxy#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/csurong/codex-proxy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/csurong/codex-proxy/issues"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,6 +21,7 @@
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^3.1.0",
+    "@tauri-apps/cli": "^2.11.2",
     "svelte": "^4.2.0",
     "typescript": "^5.4.0",
     "vite": "^5.2.0"

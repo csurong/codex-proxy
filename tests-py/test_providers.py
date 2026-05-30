@@ -4,7 +4,8 @@ import pytest
 from codex_proxy.providers import (
     ProviderRuntime, ModelMeta,
     normalize_mimo, normalize_vllm, normalize_custom, normalize_body,
-    resolve_mimo_base_url, find_provider_for_model, strip_images_for_non_vision,
+    resolve_mimo_base_url, find_provider_for_model, resolve_provider_for_model,
+    strip_images_for_non_vision, body_has_images, find_image_model,
 )
 
 
@@ -125,6 +126,44 @@ def test_select_provider_fallback(mimo_runtime, vllm_runtime):
     assert p.id == "mimo"  # first provider
 
 
+def test_custom_provider_exact_model_shadows_builtin(mimo_runtime):
+    custom = ProviderRuntime(
+        id="custom_1", type="custom", display_name="Custom",
+        base_url="http://custom.example/v1",
+        models=[ModelMeta("mimo-v2.5-pro")],
+    )
+
+    selection = resolve_provider_for_model([mimo_runtime, custom], "mimo-v2.5-pro")
+
+    assert selection.provider.id == "custom_1"
+    assert selection.model_id == "mimo-v2.5-pro"
+    assert selection.model_meta is not None
+
+
+def test_provider_alias_rewrites_request_model_to_configured_model(mimo_runtime):
+    custom = ProviderRuntime(
+        id="local", type="custom", display_name="Local",
+        base_url="http://local.example/v1",
+        config={"aliases": {"gpt-5": "local-qwen"}},
+        models=[ModelMeta("local-qwen")],
+    )
+
+    selection = resolve_provider_for_model([mimo_runtime, custom], "gpt-5")
+
+    assert selection.provider.id == "local"
+    assert selection.request_model == "gpt-5"
+    assert selection.model_id == "local-qwen"
+    assert selection.rewritten is True
+
+
+def test_unknown_model_falls_back_to_first_available_model(mimo_runtime, vllm_runtime):
+    selection = resolve_provider_for_model([mimo_runtime, vllm_runtime], "unknown-model")
+
+    assert selection.provider.id == "mimo"
+    assert selection.model_id == "mimo-v2.5-pro"
+    assert selection.rewritten is True
+
+
 # Image stripping
 
 def test_strip_images_for_non_vision():
@@ -152,6 +191,20 @@ def test_keep_images_for_vision():
     assert len(result[0]["content"]) == 2
 
 
+def test_body_has_images_detects_chat_image_parts():
+    assert body_has_images({
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}],
+    }) is True
+    assert body_has_images({"messages": [{"role": "user", "content": "look"}]}) is False
+
+
+def test_find_image_model_picks_first_vision_model(mimo_runtime):
+    assert find_image_model(mimo_runtime).model_id == "mimo-v2.5"
+
+
 def test_strip_images_empty_content():
     messages = [{"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": "data:..."}},
@@ -168,6 +221,12 @@ def test_normalize_body_dispatches_to_mimo(mimo_runtime):
     body = {"model": "mimo-v2.5-pro", "messages": []}
     result = normalize_body(mimo_runtime, body, "mimo-v2.5-pro")
     assert "thinking" in result
+
+
+def test_normalize_body_preserves_explicit_disabled_thinking(mimo_runtime):
+    body = {"model": "mimo-v2.5-pro", "messages": [], "thinking": {"type": "disabled"}}
+    result = normalize_body(mimo_runtime, body, "mimo-v2.5-pro")
+    assert result["thinking"] == {"type": "disabled"}
 
 
 def test_normalize_body_dispatches_to_vllm(vllm_runtime):

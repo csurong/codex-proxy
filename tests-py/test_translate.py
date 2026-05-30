@@ -73,6 +73,42 @@ def test_web_search_dropped():
     assert body["tools"][0]["function"]["name"] == "search"
 
 
+def test_web_search_forwarded_when_enabled():
+    req = ResponsesRequest(model="test", input="hi", tools=[
+        {"type": "function", "name": "search"},
+        {
+            "type": "web_search_preview",
+            "user_location": {"type": "approximate", "country": "US"},
+            "max_keyword": 3,
+            "force_search": True,
+            "limit": 5,
+        },
+    ])
+
+    body = req_to_chat(req, enable_web_search=True)
+
+    assert len(body["tools"]) == 2
+    assert body["tools"][0]["function"]["name"] == "search"
+    assert body["tools"][1] == {
+        "type": "web_search",
+        "user_location": {"type": "approximate", "country": "US"},
+        "max_keyword": 3,
+        "force_search": True,
+        "limit": 5,
+    }
+
+
+def test_duplicate_web_search_tools_deduped_when_enabled():
+    req = ResponsesRequest(model="test", input="hi", tools=[
+        {"type": "web_search"},
+        {"type": "web_search_preview"},
+    ])
+
+    body = req_to_chat(req, enable_web_search=True)
+
+    assert body["tools"] == [{"type": "web_search"}]
+
+
 def test_custom_tool_converted():
     req = ResponsesRequest(model="test", input="hi", tools=[
         {"type": "custom", "name": "my_tool", "description": "A custom tool", "format": {"type": "grammar"}},

@@ -12,9 +12,16 @@ node_modules/
 
 # Rust / Tauri
 src-tauri/target/
+src-tauri/binaries/
+src-tauri/gen/
+src-tauri/icons/icon.iconset/
 
 # Build output
+build/
 dist/
+*.spec
+*.dmg
+*.pkg
 
 # IDE
 .idea/

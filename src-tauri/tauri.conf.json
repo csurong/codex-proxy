@@ -1,7 +1,7 @@
 {
   "productName": "Codex-Proxy",
   "version": "0.1.0",
-  "identifier": "com.codex-proxy.app",
+  "identifier": "com.codex-proxy.desktop",
   "build": {
     "frontendDist": "../static",
     "devUrl": "http://localhost:5173",
@@ -25,7 +25,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": ["codex-proxy"],
+    "resources": ["binaries/codex-proxy"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
