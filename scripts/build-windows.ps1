@@ -26,6 +26,7 @@ npm run build
 & $PyInstaller `
     --clean `
     --onefile `
+    --noconsole `
     --name codex-proxy `
     --distpath src-tauri\binaries `
     --add-data "static;static" `

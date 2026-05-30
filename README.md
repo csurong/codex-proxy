@@ -132,6 +132,10 @@ Windows 下 sidecar 输出位置是：
 src-tauri\binaries\codex-proxy.exe
 ```
 
+Windows 桌面包默认应使用 PyInstaller 的 `--noconsole` 参数构建 sidecar，
+否则启动桌面应用时会额外弹出一个黑色控制台窗口。需要排查后端启动日志时，
+可以临时去掉 `--noconsole` 后重新打包。
+
 ### 注意事项
 
 - API Key 仅保存在本机 SQLite 数据库中，默认路径为 `~/.codex-proxy/data`。
@@ -269,6 +273,11 @@ On Windows the sidecar is built into:
 ```text
 src-tauri\binaries\codex-proxy.exe
 ```
+
+The Windows sidecar should be built with PyInstaller's `--noconsole` flag for
+normal desktop use. Without it, Windows opens an extra console window for the
+bundled backend process. Remove `--noconsole` temporarily when you need to debug
+backend startup logs.
 
 ### Notes
 
