@@ -14,6 +14,15 @@ const HEALTH_URL: &str = "http://127.0.0.1:18788/admin/api/status";
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_INTERVAL: Duration = Duration::from_millis(500);
 
+fn stop_sidecar(app: &tauri::AppHandle) {
+    let state = app.state::<Sidecar>();
+    let mut guard = state.0.lock().unwrap();
+    if let Some(mut child) = guard.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -67,15 +76,15 @@ fn main() {
         })
         .on_window_event(|window, event| {
             // Kill sidecar on window close
-            if let tauri::WindowEvent::Destroyed = event {
-                let app = window.app_handle();
-                let state = app.state::<Sidecar>();
-                let mut guard = state.0.lock().unwrap();
-                if let Some(ref mut child) = *guard {
-                    let _ = child.kill();
-                }
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed) {
+                stop_sidecar(window.app_handle());
             }
         })
-        .run(tauri::generate_context!())
-        .expect("Failed to run Tauri app");
+        .build(tauri::generate_context!())
+        .expect("Failed to build Tauri app")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+                stop_sidecar(app);
+            }
+        });
 }
