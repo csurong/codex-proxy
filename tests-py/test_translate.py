@@ -276,6 +276,18 @@ def test_resp_to_responses_basic():
     assert resp.output[0].content[0]["text"] == "Hello!"
 
 
+def test_resp_to_responses_preserves_requested_model_when_upstream_is_rewritten():
+    chat = ChatResponse(
+        id="chatcmpl-vision", created=1000, model="vision-model",
+        choices=[ChatChoice(message=ChatChoiceMessage(content="I can see it."))],
+    )
+    req = ResponsesRequest(model="text-model", input="describe this image")
+
+    resp = resp_to_responses(chat, req)
+
+    assert resp.model == "text-model"
+
+
 def test_resp_to_responses_with_reasoning():
     chat = ChatResponse(
         id="chatcmpl-2", created=1000, model="test",

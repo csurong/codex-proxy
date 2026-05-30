@@ -683,7 +683,7 @@ def resp_to_responses(
         object="response",
         created_at=chat.created or int(time.time()),
         status="incomplete" if finish_reason == "length" else "completed",
-        model=chat.model,
+        model=req.model,
         output=output,
         usage=usage,
         reasoning={
