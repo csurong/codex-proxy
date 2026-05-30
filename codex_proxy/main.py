@@ -23,10 +23,53 @@ def run_log_cleanup(conn, interval: int = 900, max_rows: int = 1000, max_age: in
             pass
 
 
+def _parent_process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        process_query_limited_information = 0x1000
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def start_parent_watchdog(parent_pid: str | None, interval: float = 1.0) -> None:
+    if not parent_pid:
+        return
+    try:
+        pid = int(parent_pid)
+    except ValueError:
+        return
+
+    def _watch() -> None:
+        while True:
+            time.sleep(interval)
+            if not _parent_process_alive(pid):
+                os._exit(0)
+
+    threading.Thread(target=_watch, daemon=True).start()
+
+
 def main():
     cfg = load_config()
     setup_logging(cfg.verbose)
     log = get_logger()
+    start_parent_watchdog(os.environ.get("CODEX_PROXY_PARENT_PID"))
 
     # Initialize app (sets up DB)
     from .app import app, init_app, mount_static

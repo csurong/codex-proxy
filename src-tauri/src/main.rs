@@ -104,6 +104,7 @@ fn main() {
             let child = sidecar_cmd
                 .env("CODEX_PROXY_NO_BROWSER", "1")
                 .env("CODEX_PROXY_INSTANCE_ID", &instance_id)
+                .env("CODEX_PROXY_PARENT_PID", std::process::id().to_string())
                 .spawn()
                 .expect("Failed to start Python sidecar");
             let mut child = child;
